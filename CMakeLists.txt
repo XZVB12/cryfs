@@ -53,6 +53,9 @@ if(MSVC)
   add_definitions(/bigobj)
 endif()
 
+include (cmake-utils/conan-setup.cmake)
+setup_conan()
+
 add_subdirectory(vendor EXCLUDE_FROM_ALL)
 add_subdirectory(src)
 add_subdirectory(doc)
