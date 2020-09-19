@@ -1,3 +1,8 @@
+// NOMINMAX works around an MSVC issue, see https://github.com/microsoft/cppwinrt/issues/479
+#if defined(_MSC_VER)
+#define NOMINMAX
+#endif
+
 #include "Fuse.h"
 #include <memory>
 #include <cassert>
@@ -12,13 +17,13 @@
 #include <csignal>
 #include "InvalidFilesystem.h"
 #include <codecvt>
+#include <boost/algorithm/string/replace.hpp>
 
 #include <range/v3/view/split.hpp>
 #include <range/v3/view/join.hpp>
 #include <range/v3/view/filter.hpp>
 
 #if defined(_MSC_VER)
-#include <codecvt>
 #include <dokan/dokan.h>
 #endif
 
@@ -366,8 +371,8 @@ void Fuse::_createContext(const vector<string> &fuseOptions) {
     const bool has_strictatime_flag = fuseOptions.end() != std::find(fuseOptions.begin(), fuseOptions.end(), "strictatime");
     const bool has_nodiratime_flag = fuseOptions.end() != std::find(fuseOptions.begin(), fuseOptions.end(), "nodiratime");
 
-    // Default is RELATIME
-    _context = Context(relatime());
+    // Default is NOATIME, this reduces the probability for synchronization conflicts
+    _context = Context(noatime());
 
     if (has_noatime_flag) {
         ASSERT(!has_atime_flag, "Cannot have both, noatime and atime flags set.");
@@ -407,7 +412,7 @@ void Fuse::_createContext(const vector<string> &fuseOptions) {
         ASSERT(!has_atime_flag, "This shouldn't happen, or we would have hit a case above");
         ASSERT(!has_relatime_flag, "This shouldn't happen, or we would have hit a case above");
         ASSERT(!has_strictatime_flag, "This shouldn't happen, or we would have hit a case above");
-        _context->setTimestampUpdateBehavior(nodiratime_relatime()); // use relatime by default
+        _context->setTimestampUpdateBehavior(noatime()); // use noatime by default
     }
 }
 
@@ -420,7 +425,9 @@ vector<char *> Fuse::_build_argv(const bf::path &mountdir, const vector<string> 
     argv.push_back(_create_c_string(option));
   }
   _add_fuse_option_if_not_exists(&argv, "subtype", _fstype);
-  _add_fuse_option_if_not_exists(&argv, "fsname", _fsname.get_value_or(_fstype));
+  auto fsname = _fsname.get_value_or(_fstype);
+  boost::replace_all(fsname, ",", "\\,"); // Avoid fuse options parser bug where a comma in the fsname is misinterpreted as an options delimiter, see https://github.com/cryfs/cryfs/issues/326
+  _add_fuse_option_if_not_exists(&argv, "fsname", fsname);
 #ifdef __APPLE__
   // Make volume name default to mountdir on macOS
   _add_fuse_option_if_not_exists(&argv, "volname", mountdir.filename().string());

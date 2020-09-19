@@ -8,7 +8,7 @@ references:
     run:
       name: Initialize Cache
       command: |
-        echo "${APT_COMPILER_PACKAGE}_${BUILD_TOOLSET}_${CXX}_${CC}_${BUILD_TYPE}_${CXXFLAGS}" > /tmp/_build_env_vars
+        echo "${APT_COMPILER_PACKAGE}_${BUILD_TOOLSET}_${CXX}_${CC}_${BUILD_TYPE}_${CMAKE_FLAGS}_${CXXFLAGS}" > /tmp/_build_env_vars
         echo Build env vars used for cache keys:
         cat /tmp/_build_env_vars
   container_setup_pre: &container_setup_pre
@@ -51,11 +51,27 @@ references:
         deb-src http://apt.llvm.org/xenial/ llvm-toolchain-xenial-8 main
         deb http://apt.llvm.org/xenial/ llvm-toolchain-xenial-9 main
         deb-src http://apt.llvm.org/xenial/ llvm-toolchain-xenial-9 main
+        deb http://apt.llvm.org/xenial/ llvm-toolchain-xenial-10 main
+        deb-src http://apt.llvm.org/xenial/ llvm-toolchain-xenial-10 main
         EOF
         sudo chmod o-w /etc/apt/sources.list.d/clang.list
 
         DEBIAN_FRONTEND=noninteractive sudo apt-get update -qq
-        DEBIAN_FRONTEND=noninteractive sudo apt-get install -y git ccache $APT_COMPILER_PACKAGE cmake make libcurl4-openssl-dev libssl-dev libfuse-dev
+        DEBIAN_FRONTEND=noninteractive sudo apt-get install -y git ccache $APT_COMPILER_PACKAGE make libcurl4-openssl-dev libssl-dev libfuse-dev
+
+        # install cmake
+        wget -O /tmp/cmake.sh https://github.com/Kitware/CMake/releases/download/v3.6.3/cmake-3.6.3-Linux-x86_64.sh
+        if [ $(sha256sum /tmp/cmake.sh | awk '{print $1;}') == "a512fc991abf51ee8d309312e106daf11d1e6c9bd7dd1c15c2bd5f9ca820fa0f" ]; then
+          echo Correct sha256sum
+        else
+          echo Wrong sha256sum
+          sha256sum /tmp/cmake.sh
+          exit 1
+        fi
+        sudo mkdir /opt/cmake
+        sudo sh /tmp/cmake.sh --prefix=/opt/cmake --skip-license
+        sudo ln -s /opt/cmake/bin/cmake /usr/local/bin/cmake
+        cmake --version
 
         # install conan
         pyenv global 3.7.0
@@ -67,11 +83,13 @@ references:
         sudo cp -a /dev/urandom /dev/random
 
         if [ "${BUILD_TOOLSET}" = "clang" ]; then
+          # Clang needs libomp-dev for OpenMP
+          DEBIAN_FRONTEND=noninteractive sudo apt-get install -y libomp-dev libomp5
+
           # They aren't set automatically unfortunately
           sudo ln -s /usr/bin/$CC /usr/bin/clang
           sudo ln -s /usr/bin/$CXX /usr/bin/clang++
-          sudo ln -s /usr/bin/clang-tidy-8 /usr/bin/clang-tidy
-          sudo ln -s /usr/bin/run-clang-tidy-8.py /usr/bin/run-clang-tidy.py
+          sudo ln -s /usr/bin/clang-tidy-9 /usr/bin/clang-tidy
         fi
 
         # Setup build cache
@@ -81,11 +99,6 @@ references:
 
         # Setup conan cache
         echo 'export CONAN_USER_HOME=/build_cache/conan' >> $BASH_ENV
-        if [[ "${CXX}" == *"g++"* ]]; then
-          # Conan uses old gcc ABI by default but we can only build with the cxx11 ABI.
-          conan profile new default --detect
-          conan profile update settings.compiler.libcxx=libstdc++11 default
-        fi
 
         # Setup ccache
         sudo ln -s /usr/bin/ccache /usr/local/bin/$CC
@@ -106,6 +119,78 @@ references:
         cmake --version
         /usr/local/bin/$CC --version
         /usr/local/bin/$CXX --version
+  install_dependencies_locally: &install_dependencies_locally
+    # This is not required for a build with conan, this is only to be able to test building CryFS
+    # against locally installed dependency libraries.
+    run:
+      name: Install dependencies locally
+      no_output_timeout: 30m
+      command: |
+        # TODO Cache these dependencies for faster runtime
+
+        export NUMCORES=`nproc` && if [ ! -n "$NUMCORES" ]; then export NUMCORES=`sysctl -n hw.ncpu`; fi
+        echo Using $NUMCORES cores
+
+        echo Download range-v3
+        cd ~
+        wget https://github.com/ericniebler/range-v3/archive/0.9.1.tar.gz -O range-v3-0.9.1.tar.gz
+        if [ $(sha512sum range-v3-0.9.1.tar.gz | awk '{print $1;}') == "167db645527b769f3d375db63bb0a5c831e9c854bc729581a7d25c571cc1741eafb82812006c5bbe346222a73d5fbbd0b2f17119317038394ac15cf892088aa3" ]; then
+          echo Correct sha512sum
+        else
+          echo Wrong sha512sum
+          sha512sum range-v3-0.9.1.tar.gz
+          exit 1
+        fi
+        tar -xvf range-v3-0.9.1.tar.gz
+        cd range-v3-0.9.1/
+
+        echo Install range-v3
+        mkdir build
+        cd build
+        cmake .. -DRANGES_HAS_WERROR=off -DRANGE_V3_EXAMPLES=off -DRANGE_V3_TESTS=off
+        make -j$NUMCORES
+        sudo make install
+
+        echo Download spdlog
+        cd ~
+        wget https://github.com/gabime/spdlog/archive/v1.4.2.tar.gz -O spdlog.tar.gz
+        if [ $(sha512sum spdlog.tar.gz | awk '{print $1;}') == "886b489138a1bdf363b5eab65a7d973f570a01c399ff5b910fcfee172ad4ff4d42a45dc2ae24e77b07130df527fb13a86b3e55ac992e72c418aebb232e27eabf" ]; then
+          echo Correct sha512sum
+        else
+          echo Wrong sha512sum
+          sha512sum spdlog.tar.gz
+          exit 1
+        fi
+        tar -xvf spdlog.tar.gz
+        rm spdlog.tar.gz
+        cd spdlog-1.4.2
+
+        echo Install spdlog
+        mkdir build
+        cd build
+        cmake ..
+        make -j$NUMCORES
+        sudo make install
+
+        echo Download boost
+        cd ~
+        wget -O boost.tar.bz2 https://sourceforge.net/projects/boost/files/boost/1.72.0/boost_1_72_0.tar.bz2/download
+        if [ $(sha512sum boost.tar.bz2 | awk '{print $1;}') == "63bbd1743e7c904b2e69fdc2eafd1c2a8a30fd70d960dcd366059d0100f000cb605d56cbd9397bb18421631f1c9552a772c434d0f0caddbe56302273f51fd1f6" ]; then
+          echo Correct sha512sum
+        else
+          echo Wrong sha512sum
+          sha512sum boost.tar.bz2
+          exit 1
+        fi
+        echo Extracting boost
+        tar -xf boost.tar.bz2
+        rm boost.tar.bz2
+        cd boost_1_72_0
+
+        echo Install boost
+        ./bootstrap.sh --with-libraries=filesystem,system,thread,chrono,program_options
+        sudo ./b2 link=shared cxxflags=-fPIC --prefix=/usr -d0 -j$NUMCORES install
+
   build_pre: &build_pre
     restore_cache:
       keys:
@@ -132,12 +217,13 @@ references:
         ccache --max-size=512M
         ccache --show-stats
 
-        # Disable OpenMP if it is clang, because Ubuntu 14.04 doesn't have the libomp-dev package needed to support OpenMP for clang.
-        if [[ ${APT_COMPILER_PACKAGE} == clang* ]]; then
+        # OpenMP has leaks. Disable OpenMP in the asan build.
+        if [[ ${APT_COMPILER_PACKAGE} == clang* ]] && [[ ${CXXFLAGS} == *"-fsanitize=address"* ]]; then
           OPENMP_PARAMS="-DDISABLE_OPENMP=ON"
         else
           OPENMP_PARAMS=""
         fi
+
 
         # Build
         mkdir cmake
@@ -153,14 +239,14 @@ references:
       command: |
         if "${RUN_TESTS}"; then
           cd cmake
-          ./bin/gitversion-test ${GTEST_ARGS}
-          ./bin/cpp-utils-test ${GTEST_ARGS}
-          if [ ! "$DISABLE_BROKEN_ASAN_TESTS" = true ] ; then ./bin/fspp-test ${GTEST_ARGS} ; fi
-          ./bin/parallelaccessstore-test ${GTEST_ARGS}
-          ./bin/blockstore-test ${GTEST_ARGS}
-          ./bin/blobstore-test ${GTEST_ARGS}
-          ./bin/cryfs-test ${GTEST_ARGS}
-          ./bin/cryfs-cli-test ${GTEST_ARGS}
+          ./test/gitversion/gitversion-test ${GTEST_ARGS}
+          ./test/cpp-utils/cpp-utils-test ${GTEST_ARGS}
+          if [ ! "$DISABLE_BROKEN_ASAN_TESTS" = true ] ; then ./test/fspp/fspp-test ${GTEST_ARGS} ; fi
+          ./test/parallelaccessstore/parallelaccessstore-test ${GTEST_ARGS}
+          ./test/blockstore/blockstore-test ${GTEST_ARGS}
+          ./test/blobstore/blobstore-test ${GTEST_ARGS}
+          ./test/cryfs/cryfs-test ${GTEST_ARGS}
+          ./test/cryfs-cli/cryfs-cli-test ${GTEST_ARGS}
         fi
   job_definition: &job_definition
     <<: *container_config
@@ -283,7 +369,7 @@ jobs:
       CXX: clang++-4.0
       BUILD_TOOLSET: clang
       APT_COMPILER_PACKAGE: clang-4.0
-      CXXFLAGS: ""
+      CXXFLAGS: "-D_LIBCPP_DEBUG=1"
       BUILD_TYPE: "Debug"
       GTEST_ARGS: ""
       CMAKE_FLAGS: ""
@@ -307,7 +393,7 @@ jobs:
       CXX: clang++-5.0
       BUILD_TOOLSET: clang
       APT_COMPILER_PACKAGE: clang-5.0
-      CXXFLAGS: ""
+      CXXFLAGS: "-D_LIBCPP_DEBUG=1 -D_LIBCPP_ENABLE_NODISCARD=1 -D_LIBCPP_ENABLE_DEPRECATION_WARNINGS=1"
       BUILD_TYPE: "Debug"
       GTEST_ARGS: ""
       CMAKE_FLAGS: ""
@@ -331,7 +417,7 @@ jobs:
       CXX: clang++-6.0
       BUILD_TOOLSET: clang
       APT_COMPILER_PACKAGE: clang-6.0
-      CXXFLAGS: ""
+      CXXFLAGS: "-D_LIBCPP_DEBUG=1 -D_LIBCPP_ENABLE_NODISCARD=1 -D_LIBCPP_ENABLE_DEPRECATION_WARNINGS=1"
       BUILD_TYPE: "Debug"
       GTEST_ARGS: ""
       CMAKE_FLAGS: ""
@@ -355,7 +441,7 @@ jobs:
       CXX: clang++-7
       BUILD_TOOLSET: clang
       APT_COMPILER_PACKAGE: clang-7
-      CXXFLAGS: ""
+      CXXFLAGS: "-D_LIBCPP_DEBUG=1 -D_LIBCPP_ENABLE_NODISCARD=1 -D_LIBCPP_ENABLE_DEPRECATION_WARNINGS=1"
       BUILD_TYPE: "Debug"
       GTEST_ARGS: ""
       CMAKE_FLAGS: ""
@@ -379,7 +465,7 @@ jobs:
       CXX: clang++-8
       BUILD_TOOLSET: clang
       APT_COMPILER_PACKAGE: clang-8
-      CXXFLAGS: ""
+      CXXFLAGS: "-D_LIBCPP_DEBUG=1 -D_LIBCPP_ENABLE_NODISCARD=1 -D_LIBCPP_ENABLE_DEPRECATION_WARNINGS=1"
       BUILD_TYPE: "Debug"
       GTEST_ARGS: ""
       CMAKE_FLAGS: ""
@@ -403,7 +489,7 @@ jobs:
       CXX: clang++-9
       BUILD_TOOLSET: clang
       APT_COMPILER_PACKAGE: clang-9
-      CXXFLAGS: ""
+      CXXFLAGS: "-D_LIBCPP_DEBUG=1 -D_LIBCPP_ENABLE_NODISCARD=1 -D_LIBCPP_ENABLE_DEPRECATION_WARNINGS=1"
       BUILD_TYPE: "Debug"
       GTEST_ARGS: ""
       CMAKE_FLAGS: ""
@@ -415,6 +501,30 @@ jobs:
       CXX: clang++-9
       BUILD_TOOLSET: clang
       APT_COMPILER_PACKAGE: clang-9
+      CXXFLAGS: ""
+      BUILD_TYPE: "Release"
+      GTEST_ARGS: ""
+      CMAKE_FLAGS: ""
+      RUN_TESTS: true
+  clang_10_debug:
+    <<: *job_definition
+    environment:
+      CC: clang-10
+      CXX: clang++-10
+      BUILD_TOOLSET: clang
+      APT_COMPILER_PACKAGE: clang-10
+      CXXFLAGS: "-D_LIBCPP_DEBUG=1 -D_LIBCPP_ENABLE_NODISCARD=1 -D_LIBCPP_ENABLE_DEPRECATION_WARNINGS=1"
+      BUILD_TYPE: "Debug"
+      GTEST_ARGS: ""
+      CMAKE_FLAGS: ""
+      RUN_TESTS: true
+  clang_10_release:
+    <<: *job_definition
+    environment:
+      CC: clang-10
+      CXX: clang++-10
+      BUILD_TOOLSET: clang
+      APT_COMPILER_PACKAGE: clang-10
       CXXFLAGS: ""
       BUILD_TYPE: "Release"
       GTEST_ARGS: ""
@@ -456,6 +566,29 @@ jobs:
       GTEST_ARGS: ""
       CMAKE_FLAGS: ""
       RUN_TESTS: true
+  local_dependencies:
+    <<: *container_config
+    steps:
+      - <<: *cache_init
+      - <<: *container_setup_pre
+      - <<: *container_setup
+      - <<: *container_setup_post
+      - checkout
+      - <<: *install_dependencies_locally
+      - <<: *build_pre
+      - <<: *build
+      - <<: *build_post
+      - <<: *test
+    environment:
+      CC: clang-9
+      CXX: clang++-9
+      BUILD_TOOLSET: clang
+      APT_COMPILER_PACKAGE: clang-9
+      CXXFLAGS: ""
+      BUILD_TYPE: "RelWithDebInfo"
+      GTEST_ARGS: ""
+      CMAKE_FLAGS: "-DDEPENDENCY_CONFIG=../cmake-utils/DependenciesFromLocalSystem.cmake"
+      RUN_TESTS: true
   address_sanitizer:
     <<: *job_definition
     environment:
@@ -492,7 +625,7 @@ jobs:
       OMP_NUM_THREADS: "1"
       CXXFLAGS: "-O2 -fsanitize=thread -fno-omit-frame-pointer"
       BUILD_TYPE: "Debug"
-      GTEST_ARGS: "--gtest_filter=-LoggingTest.LoggingAlsoWorksAfterFork:AssertTest_*:BacktraceTest.*:SignalCatcherTest.*_thenDies:SignalHandlerTest.*_thenDies:SignalHandlerTest.givenMultipleSigIntHandlers_whenRaising_thenCatchesCorrectSignal:CliTest_Setup.*:CliTest_IntegrityCheck.*:*/CliTest_WrongEnvironment.*:CliTest_Unmount.*"
+      GTEST_ARGS: "--gtest_filter=-LoggingTest.LoggingAlsoWorksAfterFork:AssertTest_*:BacktraceTest.*:SignalCatcherTest.*_thenDies:SignalHandlerTest.*_thenDies:SignalHandlerTest.givenMultipleSigIntHandlers_whenRaising_thenCatchesCorrectSignal:CliTest_Setup.*:CliTest_IntegrityCheck.*:*/CliTest_WrongEnvironment.*:CliTest_Unmount.*:CliTest.WorksWithCommasInBasedir"
       CMAKE_FLAGS: ""
       RUN_TESTS: true
   clang_tidy:
@@ -518,10 +651,10 @@ jobs:
     - store_artifacts:
         path: /tmp/clang-tidy-fixes
     environment:
-      CC: clang-8
-      CXX: clang++-8
+      CC: clang-9
+      CXX: clang++-9
       BUILD_TOOLSET: clang
-      APT_COMPILER_PACKAGE: "clang-8 clang-tidy-8"
+      APT_COMPILER_PACKAGE: "clang-9 clang-tidy-9"
 
 workflows:
   version: 2
@@ -568,11 +701,17 @@ workflows:
         <<: *enable_for_tags
     - clang_9_release:
         <<: *enable_for_tags
+    - clang_10_debug:
+        <<: *enable_for_tags
+    - clang_10_release:
+        <<: *enable_for_tags
     - clang_werror:
         <<: *enable_for_tags
     - gcc_werror:
         <<: *enable_for_tags
     - no_compatibility:
+        <<: *enable_for_tags
+    - local_dependencies:
         <<: *enable_for_tags
     - address_sanitizer:
         <<: *enable_for_tags

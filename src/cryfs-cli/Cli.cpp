@@ -45,6 +45,7 @@ using cpputils::TempFile;
 using cpputils::RandomGenerator;
 using cpputils::unique_ref;
 using cpputils::SCrypt;
+using cpputils::either;
 using cpputils::SCryptSettings;
 using cpputils::Console;
 using cpputils::HttpClient;
@@ -101,6 +102,7 @@ namespace cryfs_cli {
         }
 #else
 # warning Update checks are disabled. The resulting executable will not go online to check for newer versions or known security vulnerabilities.
+        UNUSED(httpClient);
 #endif
         cout << endl;
     }
@@ -202,14 +204,19 @@ namespace cryfs_cli {
     CryConfigLoader::ConfigLoadResult Cli::_loadOrCreateConfig(const ProgramOptions &options, const LocalStateDir& localStateDir) {
         auto configFile = _determineConfigFile(options);
         auto config = _loadOrCreateConfigFile(std::move(configFile), localStateDir, options.cipher(), options.blocksizeBytes(), options.allowFilesystemUpgrade(), options.missingBlockIsIntegrityViolation(), options.allowReplacedFilesystem());
-        if (config == none) {
-          throw CryfsException("Could not load config file. Did you enter the correct password?", ErrorCode::WrongPassword);
+        if (config.is_left()) {
+            switch(config.left()) {
+                case CryConfigFile::LoadError::DecryptionFailed:
+                    throw CryfsException("Failed to decrypt the config file. Did you enter the correct password?", ErrorCode::WrongPassword);
+                case CryConfigFile::LoadError::ConfigFileNotFound:
+                    throw CryfsException("Could not find the cryfs.config file. Are you sure this is a valid CryFS file system?", ErrorCode::InvalidFilesystem);
+            }
         }
-        _checkConfigIntegrity(options.baseDir(), localStateDir, *config->configFile, options.allowReplacedFilesystem());
-        return std::move(*config);
+        _checkConfigIntegrity(options.baseDir(), localStateDir, *config.right().configFile, options.allowReplacedFilesystem());
+        return std::move(config.right());
     }
 
-    optional<CryConfigLoader::ConfigLoadResult> Cli::_loadOrCreateConfigFile(bf::path configFilePath, LocalStateDir localStateDir, const optional<string> &cipher, const optional<uint32_t> &blocksizeBytes, bool allowFilesystemUpgrade, const optional<bool> &missingBlockIsIntegrityViolation, bool allowReplacedFilesystem) {
+    either<CryConfigFile::LoadError, CryConfigLoader::ConfigLoadResult> Cli::_loadOrCreateConfigFile(bf::path configFilePath, LocalStateDir localStateDir, const optional<string> &cipher, const optional<uint32_t> &blocksizeBytes, bool allowFilesystemUpgrade, const optional<bool> &missingBlockIsIntegrityViolation, bool allowReplacedFilesystem) {
         // TODO Instead of passing in _askPasswordXXX functions to KeyProvider, only pass in console and move logic to the key provider,
         //      for example by having a separate CryPasswordBasedKeyProvider / CryNoninteractivePasswordBasedKeyProvider.
         auto keyProvider = make_unique_ref<CryPasswordBasedKeyProvider>(
@@ -222,11 +229,28 @@ namespace cryfs_cli {
                                cipher, blocksizeBytes, missingBlockIsIntegrityViolation).loadOrCreate(std::move(configFilePath), allowFilesystemUpgrade, allowReplacedFilesystem);
     }
 
+    namespace {
+        void printConfig(const CryConfig& config) {
+            std::cout
+                << "\n----------------------------------------------------"
+                << "\nFilesystem configuration:"
+                << "\n----------------------------------------------------"
+                << "\n- Filesystem format version: " << config.Version()
+                << "\n- Created with: CryFS " << config.CreatedWithVersion()
+                << "\n- Last opened with: CryFS " << config.LastOpenedWithVersion()
+                << "\n- Cipher: " << config.Cipher()
+                << "\n- Blocksize: " << config.BlocksizeBytes() << " bytes"
+                << "\n- Filesystem Id: " << config.FilesystemId().ToString()
+                << "\n----------------------------------------------------\n";
+        }
+    }
+
     void Cli::_runFilesystem(const ProgramOptions &options, std::function<void()> onMounted) {
         try {
             LocalStateDir localStateDir(Environment::localStateDir());
             auto blockStore = make_unique_ref<OnDiskBlockStore2>(options.baseDir());
             auto config = _loadOrCreateConfig(options, localStateDir);
+            printConfig(*config.configFile->config());
             unique_ptr<fspp::fuse::Fuse> fuse = nullptr;
             bool stoppedBecauseOfIntegrityViolation = false;
 
@@ -323,10 +347,10 @@ namespace cryfs_cli {
     }
 
 	void Cli::_sanityChecks(const ProgramOptions &options) {
-		_checkDirAccessible(bf::absolute(options.baseDir()), "base directory", ErrorCode::InaccessibleBaseDir);
+		_checkDirAccessible(bf::absolute(options.baseDir()), "base directory", options.createMissingBasedir(), ErrorCode::InaccessibleBaseDir);
 
 		if (!options.mountDirIsDriveLetter()) {
-			_checkDirAccessible(options.mountDir(), "mount directory", ErrorCode::InaccessibleMountDir);
+			_checkDirAccessible(options.mountDir(), "mount directory", options.createMissingMountpoint(), ErrorCode::InaccessibleMountDir);
 			_checkMountdirDoesntContainBasedir(options);
 		} else {
 			if (bf::exists(options.mountDir())) {
@@ -335,9 +359,14 @@ namespace cryfs_cli {
 		}
     }
 
-    void Cli::_checkDirAccessible(const bf::path &dir, const std::string &name, ErrorCode errorCode) {
+    void Cli::_checkDirAccessible(const bf::path &dir, const std::string &name, bool createMissingDir, ErrorCode errorCode) {
         if (!bf::exists(dir)) {
-            bool create = _console->askYesNo("Could not find " + name + ". Do you want to create it?", false);
+            bool create = createMissingDir;
+            if (create) {
+                LOG(INFO, "Automatically creating {}", name);
+            } else {
+                create = _console->askYesNo("Could not find " + name + ". Do you want to create it?", false);
+            }
             if (create) {
                 if (!bf::create_directory(dir)) {
                     throw CryfsException("Error creating "+name, errorCode);
